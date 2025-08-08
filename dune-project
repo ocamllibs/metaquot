@@ -4,12 +4,12 @@
 
 (name metaquot)
 (license "BSD-2-Clause")
-(maintainers "Thierry Martinez <thierry.martinez@inria.fr>")
+(maintainers "Seb Hinderer <sebastien.hinderer@inria.fr>")
 (authors "Thierry Martinez <thierry.martinez@inria.fr>")
-(source (uri "git+https://github.com/thierry-martinez/metaquot.git"))
-(homepage "https://github.com/thierry-martinez/metaquot")
-(bug_reports "https://github.com/thierry-martinez/metaquot")
-(documentation "https://github.com/thierry-martinez/metaquot")
+(source (uri "git+https://github.com/ocamllibs/metaquot.git"))
+(homepage "https://github.com/ocamllibs/metaquot")
+(bug_reports "https://github.com/ocamllibs/metaquot")
+(documentation "https://github.com/ocamllibs/metaquot")
 (version "0.5.2")
 
 (package
