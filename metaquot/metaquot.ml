@@ -241,7 +241,7 @@ let quote_of_declaration (prefix : Longident.t) (name : string)
     (declaration : Types.type_declaration) : Ppxlib.value_binding =
   let cases =
     match declaration.type_kind with
-    | Type_abstract ->
+    | Type_abstract _ ->
         [Ppxlib.Ast_helper.Exp.case (Metapp.Pat.var "x")
           (Metapp.apply
             (quote_of_type_expr (Option.get declaration.type_manifest))
