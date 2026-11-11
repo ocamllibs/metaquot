@@ -4,6 +4,9 @@
   AST): the quoters are generated from the AST version actually selected by
   ppxlib, constructors with inline records (`Pvc_constraint`) are supported,
   and `[@subst let x : t = e]` accepts constraints in `pvb_constraint`.
+
+- Lower the OCaml bound back to 4.08 (any OCaml version supported by
+  ppxlib >= 0.36); require ppxlib >= 0.36
   Quoted identifiers are built with `Ppxlib.Longident`, which differs from
   compiler-libs' `Longident` since OCaml 5.4.
 
