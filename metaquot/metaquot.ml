@@ -8,6 +8,10 @@ respectively. *)
 [%%metapackage metapp, findlib]
 [%%metaflag "-open", "Stdcompat"]
 
+(* Generated code refers to [Longident], which should be ppxlib's: since
+   OCaml 5.4, compiler-libs' [Longident] carries locations. *)
+module Longident = Ppxlib.Longident
+
 let expression_of_default_loc () : Ppxlib.expression =
   Metapp.apply (Metapp.Exp.var "!")
     [Metapp.Exp.ident
@@ -21,6 +25,20 @@ type mapper = {
 module Eq = struct
   type ('a, 'b) t = Refl : ('a, 'a) t
 end
+
+(* [Metapp.Exp.of_longident] and [Metapp.Pat.of_longident] refer to
+   [Longident], which is compiler-libs' one in user code: since OCaml 5.4,
+   it differs from ppxlib's. *)
+let quote_longident (type t) (module Value : Metapp.ValueS with type t = t)
+    (ident : Longident.t) : t =
+  let ctor name =
+    Longident.Ldot (Ldot (Lident "Ppxlib", "Longident"), name) in
+  let rec quote (ident : Longident.t) =
+    match ident with
+    | Ldot (m, v) -> Value.construct (ctor "Ldot") [quote m; Value.of_string v]
+    | Lident v -> Value.construct (ctor "Lident") [Value.of_string v]
+    | Lapply (f, x) -> Value.construct (ctor "Lapply") [quote f; quote x] in
+  quote ident
 
 module type QuoteValueS = sig
   include Metapp.ValueS
@@ -39,6 +57,8 @@ end
 module QuoteExp : QuoteValueS with type t = Ppxlib.expression = struct
   include Metapp.Exp
 
+  let of_longident = quote_longident (module Metapp.Exp)
+
   let quote_location (_ : Location.t) : Ppxlib.expression =
     expression_of_default_loc ()
 
@@ -54,6 +74,8 @@ end
 
 module QuotePat : QuoteValueS with type t = Ppxlib.pattern = struct
   include Metapp.Pat
+
+  let of_longident = quote_longident (module Metapp.Pat)
 
   let quote_location (_ : Location.t) : Ppxlib.pattern =
     Ppxlib.Ast_helper.Pat.any ()
@@ -74,6 +96,8 @@ module QuotePat : QuoteValueS with type t = Ppxlib.pattern = struct
 end
 
 [%%metadef
+module Longident = Ppxlib.Longident
+
 let ppxlib = Longident.Lident "Ppxlib"
 
 let asttypes = Longident.Ldot (ppxlib, "Asttypes")
@@ -89,18 +113,21 @@ let find_module module_name (signature : Types.signature) :
 let quote_name name =
   Printf.sprintf "%s" name
 
+let rec flatten_path (path : Path.t) : string list =
+  match path with
+  | Pident ident -> [Ident.name ident]
+  | Pdot (prefix, name) -> flatten_path prefix @ [name]
+  | _ -> failwith (Format.asprintf "flatten_path: %s" (Path.name path))
+
 let quote_of_path (path : Path.t) : Ppxlib.expression =
   let name =
-    match Untypeast.lident_of_path path with
-    | Lident name | Ldot (Lident "Asttypes", name) -> name
-    | Ldot ((Ldot (Lident "Astlib__", "Location") | Lident "Location"), "t") ->
-        "location"
-    | Ldot ((Ldot (Lident "Astlib__", "Longident")
-           | Lident "Longident"), "t") ->
-        "longident"
-    | lident ->
+    match flatten_path path with
+    | [name] | ["Asttypes"; name] -> name
+    | ["Astlib__"; "Location"; "t"] | ["Location"; "t"] -> "location"
+    | ["Astlib__"; "Longident"; "t"] | ["Longident"; "t"] -> "longident"
+    | names ->
         failwith (Format.asprintf "quote_of_path: %s"
-          (String.concat "." (Longident.flatten lident))) in
+          (String.concat "." names)) in
   Metapp.Exp.var (quote_name name)
 
 let index_variables args =
@@ -120,8 +147,12 @@ let rec quote_of_type_expr (ty : Types.type_expr) : Ppxlib.expression =
       Metapp.apply (quote_of_path path)
         ~labels:["subst", [%e subst]] ~optional:["in_list", [%e in_list]]
         (List.map quote_of_type_expr args)
-  | Ttuple args ->
-      let args = index_variables args in
+  | Ttuple _ ->
+      (* [Btype.iter_type_expr] enumerates the components independently of
+         the labeled tuples introduced in OCaml 5.4. *)
+      let args = ref [] in
+      Btype.iter_type_expr (fun arg -> args := arg :: !args) ty;
+      let args = index_variables (List.rev !args) in
       let pat =
         Metapp.Pat.tuple
           (List.map (fun (x, _) -> Metapp.Pat.var x) args) in
@@ -138,22 +169,45 @@ let rec quote_of_type_expr (ty : Types.type_expr) : Ppxlib.expression =
 
 let case_of_ctor (prefix : Longident.t)
     (declaration : Types.constructor_declaration) : Ppxlib.case =
-  let args =
-    match declaration.cd_args with
-    | Cstr_tuple args -> args
-    | _ -> assert false in
-  let args = index_variables args in
   let name = Ident.name declaration.cd_id in
-  let pat =
-    Metapp.Pat.construct (Lident name)
-      (List.map (fun (x, _) -> Metapp.Pat.var x) args) in
+  let pat, args =
+    match declaration.cd_args with
+    | Cstr_tuple args ->
+        let args = index_variables args in
+        let pat =
+          Metapp.Pat.construct (Lident name)
+            (List.map (fun (x, _) -> Metapp.Pat.var x) args) in
+        let args =
+          args |> List.map (fun (x, arg) ->
+            Metapp.apply (quote_of_type_expr arg) [Metapp.Exp.var x]) in
+        pat, args
+    | Cstr_record labels ->
+        (* Inline records, such as [Pvc_constraint] in the OCaml 5.2 AST.
+           Their labels are not qualified, since they do not belong to
+           the module. *)
+        let labels = index_variables labels in
+        let pat =
+          Metapp.Pat.construct (Lident name) [Metapp.Pat.record
+            (labels |> List.map
+              (fun (x, (label : Types.label_declaration)) ->
+                (Longident.Lident (Ident.name label.ld_id),
+                  Metapp.Pat.var x)))] in
+        let record =
+          Metapp.apply
+            (Metapp.Exp.ident (Ldot (Lident "Target", "record")))
+            [Metapp.Exp.list
+              (labels |> List.map
+                (fun (x, (label : Types.label_declaration)) ->
+                  Metapp.Exp.tuple [
+                    Metapp.Exp.of_longident
+                      (Lident (Ident.name label.ld_id));
+                    Metapp.apply (quote_of_type_expr label.ld_type)
+                      [Metapp.Exp.var x]]))] in
+        pat, [record] in
   let exp =
     [%e Target.construct
        [%meta Metapp.Exp.of_longident (Ldot (prefix, name))]
-       [%meta Metapp.Exp.list
-          (args |> List.map (fun (x, arg) ->
-            Metapp.apply (quote_of_type_expr arg)
-              [Metapp.Exp.var x]))]] in
+       [%meta Metapp.Exp.list args]] in
   Ppxlib.Ast_helper.Exp.case pat exp
 
 let quote_of_record (prefix : Longident.t)
@@ -360,9 +414,23 @@ let compiler_libs = Findlib.package_directory "ppxlib.ast"
 let signature_of_cmi filename =
   (Cmi_format.read_cmi (Filename.concat compiler_libs filename)).cmi_sign
 
+(* The AST version selected by ppxlib is given by the alias
+   [Ppxlib_ast.Import.Js = Versions.OCaml_XXX]: [Metapp.ast_version] is not
+   reliable since ppxlib 0.36, which moved to the OCaml 5.2 AST. *)
 let ast_module_name =
-  let major, minor = Metapp.ast_version in
-  Printf.sprintf "OCaml_%d%.2d" major minor
+  let import = signature_of_cmi "ppxlib_ast__Import.cmi" in
+  match
+    import |> List.find_map (fun (item : Types.signature_item) ->
+      match item with
+      | Sig_module (ident, _, { md_type = Mty_alias path; _ }, _, _)
+        when Ident.name ident = "Js" ->
+          Some (List.hd (List.rev (flatten_path path)))
+      | _ -> None)
+  with
+  | Some name -> name
+  | None ->
+      let major, minor = Metapp.ast_version in
+      Printf.sprintf "OCaml_%d%.2d" major minor
 
 let ppxlib_signature =
   Option.get (find_module "Ast"
@@ -405,6 +473,15 @@ module Make (Target : QuoteValueS) = struct
             match expr with
             | { pexp_desc = Pexp_constraint (expr, _); _ } -> expr
             | _ -> expr in
+          identifier, { ty; target = Target.subst_of_expr expr }
+      | { pvb_pat = { ppat_desc =
+            Ppat_var { txt = identifier; _ }
+          | Ppat_construct ({ txt = Lident identifier; _ }, None)};
+          pvb_constraint = Some (Pvc_constraint { typ =
+            { ptyp_desc = Ptyp_constr ({ txt = Lident ty; _ }, [])}
+          | { ptyp_desc = Ptyp_poly (_, { ptyp_desc =
+              Ptyp_constr ({ txt = Lident ty; _ }, [])})}; _ });
+          pvb_expr = expr } ->
           identifier, { ty; target = Target.subst_of_expr expr }
       | { pvb_loc; _ } ->
           Location.raise_errorf ~loc:pvb_loc "Typed value-binding expected"
